@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.json
+!deno.json
+!package.json
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+
+# Deno
+deno.lock
