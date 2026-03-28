@@ -28,13 +28,14 @@ interface TelegramUpdate {
 }
 
 interface ParsedTransaction {
-  action: "create" | "summary" | "delete_last" | "list" | "categories" | "budget" | "unknown";
+  action: "create" | "summary" | "delete_last" | "delete" | "list" | "categories" | "budget" | "unknown";
   type?: "income" | "expense";
   amount?: number;
   category?: string;
   note?: string;
   date?: string;
   merchant?: string;
+  id?: string;
 }
 
 interface BillItem {
@@ -71,6 +72,7 @@ const WEBHOOK_SECRET  = Deno.env.get("TELEGRAM_SECRET") ?? "";
 const GEMINI_API_KEY  = Deno.env.get("GEMINI_API_KEY") ?? "";
 const SPREADSHEET_ID  = Deno.env.get("GOOGLE_SPREADSHEET_ID") ?? "";
 const SERVICE_ACCOUNT = JSON.parse(Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY") ?? "{}");
+const GEMINI_MODEL    = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.0-flash";
 
 function today(): string {
   return SheetsService.witaNow().date;
@@ -88,7 +90,9 @@ function getSheets(): SheetsService {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatIDR(amount: number): string {
-  return "Rp " + Math.round(amount).toLocaleString("id-ID");
+  const str = Math.round(amount).toString();
+  const formatted = str.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return "Rp " + formatted;
 }
 
 function isSplitRequest(caption: string): boolean {
@@ -300,9 +304,9 @@ async function parseTextWithGemini(text: string): Promise<ParsedTransaction> {
     `Message: "${text}"`;
 
   const result = await genAI.models.generateContent({
-    model: "gemini-1.5-flash",
+    model: GEMINI_MODEL,
     contents: [{ role: "user", parts: [{ text: prompt }] }],
-    config: { responseMimeType: "application/json" },
+    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
   });
 
   const raw = result.text ?? "";
@@ -326,7 +330,7 @@ async function parseExpenseImageWithGemini(imageBytes: Uint8Array): Promise<{
     `- date = today if not on receipt: ${today()}`;
 
   const result = await genAI.models.generateContent({
-    model: "gemini-1.5-flash",
+    model: GEMINI_MODEL,
     contents: [{
       role: "user",
       parts: [
@@ -334,7 +338,7 @@ async function parseExpenseImageWithGemini(imageBytes: Uint8Array): Promise<{
         { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
       ],
     }],
-    config: { responseMimeType: "application/json" },
+    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
   });
 
   const raw = result.text ?? "";
@@ -378,7 +382,7 @@ async function parseSplitBillWithGemini(
     `- date: ${today()} if not visible`;
 
   const result = await genAI.models.generateContent({
-    model: "gemini-1.5-flash",
+    model: GEMINI_MODEL,
     contents: [{
       role: "user",
       parts: [
@@ -386,7 +390,7 @@ async function parseSplitBillWithGemini(
         { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
       ],
     }],
-    config: { responseMimeType: "application/json" },
+    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
   });
 
   const raw = result.text ?? "";
@@ -624,9 +628,11 @@ Deno.serve(async (req) => {
         await handleDeleteLast(chatId);
         return new Response("ok", { status: 200 });
       }
-      if (text.startsWith("/delete ")) {
-        const id = text.replace("/delete ", "").trim();
-        await handleDeleteById(chatId, id);
+
+      // Delete by ID — match "delete txn_...", "/delete txn_...", "hapus txn_..."
+      const txnIdMatch = text.match(/\b(txn_\d+)\b/);
+      if (txnIdMatch) {
+        await handleDeleteById(chatId, txnIdMatch[1]);
         return new Response("ok", { status: 200 });
       }
 

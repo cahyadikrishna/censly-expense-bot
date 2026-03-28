@@ -122,7 +122,7 @@ async function sheetsGet(
   spreadsheetId: string,
   range: string
 ): Promise<string[][]> {
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?valueRenderOption=UNFORMATTED_VALUE`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -155,7 +155,7 @@ async function sheetsBatchGet(
   ranges: string[]
 ): Promise<string[][][]> {
   const params = ranges.map((r) => `ranges=${encodeURIComponent(r)}`).join("&");
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?${params}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?valueRenderOption=UNFORMATTED_VALUE&${params}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -193,6 +193,27 @@ function witaNow(): { date: string; time: string } {
 
 function generateId(): string {
   return `txn_${Date.now()}`;
+}
+
+// Convert Excel serial date (e.g. 46109) to "YYYY-MM-DD"
+// and serial time fraction (e.g. 0.53) to "HH:MM"
+function parseSheetDate(val: unknown): string {
+  if (typeof val === "number") {
+    // Excel epoch: 1899-12-30
+    const ms = (val - 25569) * 86400000;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+  return String(val ?? "");
+}
+
+function parseSheetTime(val: unknown): string {
+  if (typeof val === "number") {
+    const totalMinutes = Math.round(val * 1440);
+    const h = String(Math.floor(totalMinutes / 60)).padStart(2, "0");
+    const m = String(totalMinutes % 60).padStart(2, "0");
+    return `${h}:${m}`;
+  }
+  return String(val ?? "");
 }
 
 // ── SheetsService class ───────────────────────────────────────────────────────
@@ -254,17 +275,17 @@ export class SheetsService {
     let transactions = rows
       .filter((r) => r.length >= 6 && r[0])
       .map((r): TransactionRow => ({
-        id: r[0] ?? "",
-        date: r[1] ?? "",
-        time: r[2] ?? "",
-        category: r[3] ?? "",
-        subcategory: r[4] ?? "",
-        amount: parseFloat(r[5] ?? "0") || 0,
-        currency: r[6] ?? "IDR",
-        merchant: r[7] ?? "",
-        note: r[8] ?? "",
-        source: r[9] ?? "",
-        raw_image_url: r[10] ?? "",
+        id: String(r[0] ?? ""),
+        date: parseSheetDate(r[1]),
+        time: parseSheetTime(r[2]),
+        category: String(r[3] ?? ""),
+        subcategory: String(r[4] ?? ""),
+        amount: Number(r[5]) || 0,
+        currency: String(r[6] ?? "IDR"),
+        merchant: String(r[7] ?? ""),
+        note: String(r[8] ?? ""),
+        source: String(r[9] ?? ""),
+        raw_image_url: String(r[10] ?? ""),
       }));
 
     if (filters.month !== undefined && filters.year !== undefined) {
@@ -352,12 +373,16 @@ export class SheetsService {
     updates: Partial<Omit<TransactionRow, "id">>
   ): Promise<{ success: boolean; message: string }> {
     const token = await this.token();
-    const rows = await sheetsGet(token, this.spreadsheetId, "Transactions!A2:K10000");
+    // Fetch full column A:K (including header) so array index = sheet row index
+    const allRows = await sheetsGet(token, this.spreadsheetId, "Transactions!A:K");
 
-    const rowIndex = rows.findIndex((r) => r[0] === id);
-    if (rowIndex === -1) return { success: false, message: `Transaction ${id} not found` };
+    let matchIndex = -1;
+    for (let i = 1; i < allRows.length; i++) {
+      if (allRows[i][0] === id) { matchIndex = i; break; }
+    }
+    if (matchIndex === -1) return { success: false, message: `Transaction ${id} not found` };
 
-    const existing = rows[rowIndex];
+    const existing = allRows[matchIndex];
     const updated = [
       existing[0],                          // id (immutable)
       updates.date        ?? existing[1],
@@ -372,8 +397,8 @@ export class SheetsService {
       updates.raw_image_url ?? existing[10],
     ];
 
-    // +2 because row 1 is header, rowIndex is 0-based from row 2
-    const sheetRow = rowIndex + 2;
+    // matchIndex is the 0-based array index; sheet row number (1-based) = matchIndex + 1
+    const sheetRow = matchIndex + 1;
     await sheetsUpdate(token, this.spreadsheetId, `Transactions!A${sheetRow}:K${sheetRow}`, [updated]);
     console.log("[sheets] updateTransaction:", id, "row:", sheetRow);
     return { success: true, message: `Transaction ${id} updated` };
@@ -383,26 +408,45 @@ export class SheetsService {
 
   async deleteTransaction(id: string): Promise<{ success: boolean; message: string; deleted?: TransactionRow }> {
     const token = await this.token();
-    const rows = await sheetsGet(token, this.spreadsheetId, "Transactions!A2:K10000");
 
-    const rowIndex = rows.findIndex((r) => r[0] === id);
-    if (rowIndex === -1) return { success: false, message: `Transaction ${id} not found` };
+    // Fetch column A with row numbers to find the exact sheet row for this ID.
+    // values.get can skip empty rows, making array index unreliable for deletion.
+    // Using a MATCH-style lookup via the spreadsheet formula would be ideal, but
+    // the simplest reliable approach: fetch IDs with row metadata.
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${this.spreadsheetId}/values/Transactions!A:K?valueRenderOption=UNFORMATTED_VALUE`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`Sheets GET error: ${JSON.stringify(json)}`);
+    const allRows: string[][] = json.values ?? [];
 
+    // allRows[0] = header, allRows[1] = first data row (sheet row 2), etc.
+    // allRows index i corresponds to sheet row i (0-based for deleteDimension)
+    let matchIndex = -1;
+    for (let i = 1; i < allRows.length; i++) {
+      if (allRows[i][0] === id) {
+        matchIndex = i;
+        break;
+      }
+    }
+
+    if (matchIndex === -1) return { success: false, message: `Transaction ${id} not found` };
+
+    const r = allRows[matchIndex];
     const deleted: TransactionRow = {
-      id: rows[rowIndex][0],
-      date: rows[rowIndex][1],
-      time: rows[rowIndex][2],
-      category: rows[rowIndex][3],
-      subcategory: rows[rowIndex][4],
-      amount: parseFloat(rows[rowIndex][5]) || 0,
-      currency: rows[rowIndex][6],
-      merchant: rows[rowIndex][7],
-      note: rows[rowIndex][8],
-      source: rows[rowIndex][9],
-      raw_image_url: rows[rowIndex][10],
+      id: String(r[0] ?? ""),
+      date: parseSheetDate(r[1]),
+      time: parseSheetTime(r[2]),
+      category: String(r[3] ?? ""),
+      subcategory: String(r[4] ?? ""),
+      amount: Number(r[5]) || 0,
+      currency: String(r[6] ?? "IDR"),
+      merchant: String(r[7] ?? ""),
+      note: String(r[8] ?? ""),
+      source: String(r[9] ?? ""),
+      raw_image_url: String(r[10] ?? ""),
     };
 
-    // Get spreadsheet metadata to find Transactions sheet ID
+    // Get Transactions sheet ID for deleteDimension
     const metaRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${this.spreadsheetId}?fields=sheets.properties`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -411,23 +455,26 @@ export class SheetsService {
     const txSheet = meta.sheets?.find((s: { properties: { title: string } }) => s.properties.title === "Transactions");
     const sheetId = txSheet?.properties?.sheetId ?? 0;
 
-    const sheetRowIndex = rowIndex + 1; // +1 for header, 0-based
-    const url = `https://sheets.googleapis.com/v4/spreadsheets/${this.spreadsheetId}:batchUpdate`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        requests: [{
-          deleteDimension: {
-            range: { sheetId, dimension: "ROWS", startIndex: sheetRowIndex, endIndex: sheetRowIndex + 1 },
-          },
-        }],
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) throw new Error(`Delete row error: ${JSON.stringify(json)}`);
+    // matchIndex directly maps to the 0-based sheet row index
+    // (allRows[0]=header=row0, allRows[1]=first data=row1, etc.)
+    const deleteRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${this.spreadsheetId}:batchUpdate`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requests: [{
+            deleteDimension: {
+              range: { sheetId, dimension: "ROWS", startIndex: matchIndex, endIndex: matchIndex + 1 },
+            },
+          }],
+        }),
+      },
+    );
+    const deleteJson = await deleteRes.json();
+    if (!deleteRes.ok) throw new Error(`Delete row error: ${JSON.stringify(deleteJson)}`);
 
-    console.log("[sheets] deleteTransaction:", id, "row:", sheetRowIndex);
+    console.log("[sheets] deleteTransaction:", id, "sheetRow:", matchIndex);
     return { success: true, message: `Transaction ${id} deleted`, deleted };
   }
 
@@ -450,7 +497,7 @@ export class SheetsService {
       .map((r): CategoryRow => ({
         category: r[0] ?? "",
         emoji: r[1] ?? "📦",
-        budget_per_month: parseFloat(r[2] ?? "0") || 0,
+        budget_per_month: Number(r[2]) || 0,
         color: r[3] ?? "#A3A3A3",
         icon_name: r[4] ?? "box",
       }));
