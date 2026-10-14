@@ -1,9 +1,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { GoogleGenAI } from "https://esm.sh/@google/genai";
-import { encodeBase64 } from "https://deno.land/std@0.203.0/encoding/base64.ts";
 import dayjs from "https://esm.sh/dayjs";
 import { SheetsService } from "./sheets.ts";
 import type { TransactionRow, MonthlySummary } from "./sheets.ts";
+import { parseText, parseExpenseImage, parseSplitBill, parseDebt } from "./llm.ts";
+import type { ParsedTransaction, SplitBillResult } from "./llm.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,58 +27,12 @@ interface TelegramUpdate {
   message?: TelegramMessage;
 }
 
-interface ParsedTransaction {
-  action: "create" | "summary" | "delete_last" | "delete" | "list" | "categories" | "budget" | "unknown";
-  type?: "income" | "expense";
-  amount?: number;
-  category?: string;
-  note?: string;
-  date?: string;
-  merchant?: string;
-  id?: string;
-}
-
-interface BillItem {
-  name: string;
-  price: number;
-  quantity: number;
-}
-
-interface PersonShare {
-  name: string;
-  items: { name: string; price: number }[];
-  subtotal: number;
-  tax: number;
-  service: number;
-  total: number;
-}
-
-interface SplitBillResult {
-  store_name: string;
-  date: string;
-  items: BillItem[];
-  subtotal: number;
-  tax: number;
-  service: number;
-  grand_total: number;
-  people: PersonShare[];
-  unassigned_items: BillItem[];
-}
-
-interface ParsedDebt {
-  person_name: string;
-  item: string;
-  amount: number;
-}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BOT_TOKEN       = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const WEBHOOK_SECRET  = Deno.env.get("TELEGRAM_SECRET") ?? "";
-const GEMINI_API_KEY  = Deno.env.get("GEMINI_API_KEY") ?? "";
 const SPREADSHEET_ID  = Deno.env.get("GOOGLE_SPREADSHEET_ID") ?? "";
 const SERVICE_ACCOUNT = JSON.parse(Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY") ?? "{}");
-const GEMINI_MODEL    = "gemini-3.1-flash-lite"
 
 function today(): string {
   return SheetsService.witaNow().date;
@@ -288,154 +242,6 @@ function buildSplitResultMessage(result: SplitBillResult): string {
   return lines.join("\n");
 }
 
-// ── Gemini calls ──────────────────────────────────────────────────────────────
-
-async function parseTextWithGemini(text: string): Promise<ParsedTransaction> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const prompt =
-    `You are an expense tracking assistant for Indonesian users.\n` +
-    `Parse this message into a transaction or command.\n` +
-    `Respond ONLY in valid JSON, no markdown:\n` +
-    `{"action":"create"|"summary"|"delete_last"|"list"|"categories"|"budget"|"unknown",` +
-    `"type":"income"|"expense","amount":45000,"category":"Makan","note":"desc",` +
-    `"merchant":"store name","date":"YYYY-MM-DD"}\n\n` +
-    `Rules:\n` +
-    `- "rb"/"ribu"=thousands, "jt"/"juta"=millions\n` +
-    `- "kemarin"=yesterday, "hari ini"/"tadi"=today\n` +
-    `- category: Makan|Transport|Belanja|Tagihan|Kesehatan|Hiburan|Gaji|Freelance|Lainnya\n` +
-    `- rekap/summary/pengeluaran bulan → action="summary"\n` +
-    `- hapus/batal/delete last/hapus terakhir → action="delete_last"\n` +
-    `- list/daftar/transaksi → action="list"\n` +
-    `- kategori/categories → action="categories"\n` +
-    `- budget/anggaran → action="budget"\n` +
-    `- default type="expense" unless clearly income\n` +
-    `- today: ${today()}\n\n` +
-    `Message: "${text}"`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseText] raw:", raw);
-  return JSON.parse(raw) as ParsedTransaction;
-}
-
-async function parseExpenseImageWithGemini(imageBytes: Uint8Array): Promise<{
-  category: string; amount: number; merchant: string; note: string; date: string;
-}> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const prompt =
-    `Extract expense data from this receipt.\n` +
-    `Respond ONLY in valid JSON:\n` +
-    `{"category":"Makan","amount":45000,"merchant":"Nama Toko","note":"desc","date":"YYYY-MM-DD"}\n\n` +
-    `Rules:\n` +
-    `- amount = TOTAL as integer IDR\n` +
-    `- category: Makan|Transport|Belanja|Tagihan|Kesehatan|Hiburan|Lainnya\n` +
-    `- merchant = store/restaurant name from receipt\n` +
-    `- date = today if not on receipt: ${today()}`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
-      ],
-    }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseExpenseImage] raw:", raw);
-  return JSON.parse(raw);
-}
-
-async function parseSplitBillWithGemini(
-  imageBytes: Uint8Array,
-  caption: string
-): Promise<SplitBillResult> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const instructions = caption
-    .replace(/split\s*(this\s*)?(bill)?/gi, "")
-    .replace(/bagi\s*(tagihan|bill|rata)?/gi, "")
-    .replace(/patungan/gi, "")
-    .replace(/pisah\s*(tagihan|bill)?/gi, "")
-    .trim();
-
-  const prompt =
-    `You are a precise bill splitting assistant for Indonesian restaurant bills.\n\n` +
-    `DEFAULT RULES (apply when not overridden):\n` +
-    `- Unassigned items: split equally among all people\n` +
-    `- Tax and service: split equally among all people\n` +
-    `- Shared items (table fee, shared dishes): split equally\n` +
-    `- No people mentioned: 1 person pays full amount\n` +
-    (instructions ? `\nUSER INSTRUCTIONS (override defaults):\n${instructions}\n` : "") +
-    `\nRespond ONLY in valid JSON:\n` +
-    `{"store_name":"...","date":"YYYY-MM-DD",` +
-    `"items":[{"name":"...","price":35000,"quantity":1}],` +
-    `"subtotal":150000,"tax":16500,"service":15000,"grand_total":181500,` +
-    `"people":[{"name":"yoga","items":[{"name":"Nasi Goreng","price":35000}],` +
-    `"subtotal":35000,"tax":5500,"service":5000,"total":45500}],` +
-    `"unassigned_items":[]}\n\n` +
-    `Rules:\n` +
-    `- All prices as integer IDR\n` +
-    `- Fuzzy match item names to receipt\n` +
-    `- "dibagi rata"=equal split, "proporsional"=proportional to subtotal\n` +
-    `- Sum of people totals must equal grand_total minus unassigned\n` +
-    `- date: ${today()} if not visible`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
-      ],
-    }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseSplitBill] raw:", raw);
-  return JSON.parse(raw) as SplitBillResult;
-}
-
-async function parseDebtWithGemini(text: string): Promise<ParsedDebt> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const prompt =
-    `You are an expense tracking assistant for Indonesian users.\n` +
-    `The user paid for someone else's item and wants to track what that person owes them.\n` +
-    `Parse this message and extract the person name, item description, and amount.\n` +
-    `Respond ONLY in valid JSON, no markdown:\n` +
-    `{"person_name":"Widhi","item":"drink","amount":170000}\n\n` +
-    `Rules:\n` +
-    `- "rb"/"ribu" = ×1000, "k" at end = ×1000, "jt"/"juta" = ×1,000,000\n` +
-    `- person_name: the person who owes the money (first proper noun after "deb ")\n` +
-    `- item: what was bought (brief description, in English or Indonesian)\n` +
-    `- amount: integer IDR\n` +
-    `- today: ${today()}\n\n` +
-    `Message: "${text}"`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseDebt] raw:", raw);
-  return JSON.parse(raw) as ParsedDebt;
-}
-
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleExpenseScan(
@@ -446,7 +252,7 @@ async function handleExpenseScan(
   const sheets = getSheets();
   const { date, time } = SheetsService.witaNow();
 
-  const extracted = await parseExpenseImageWithGemini(imageBytes);
+  const extracted = await parseExpenseImage(imageBytes, today());
   console.log("[handleExpenseScan] extracted:", JSON.stringify(extracted));
 
   const result = await sheets.addTransaction({
@@ -634,7 +440,7 @@ async function handleSplitBill(
   caption: string,
   chatId: number
 ): Promise<void> {
-  const result = await parseSplitBillWithGemini(imageBytes, caption);
+  const result = await parseSplitBill(imageBytes, caption, today());
   console.log("[handleSplitBill] people:", result.people.length, "total:", result.grand_total);
   // Split bills are not saved to the sheet — display only
   await sendMessage(chatId, buildSplitResultMessage(result));
@@ -642,7 +448,7 @@ async function handleSplitBill(
 
 async function handleDebtCreate(chatId: number, text: string): Promise<void> {
   const sheets = getSheets();
-  const parsed = await parseDebtWithGemini(text);
+  const parsed = await parseDebt(text, today());
   console.log("[handleDebtCreate] parsed:", JSON.stringify(parsed));
 
   const result = await sheets.addDebt({
@@ -786,7 +592,7 @@ Deno.serve(async (req) => {
       }
 
       // Natural language
-      const parsed = await parseTextWithGemini(text);
+      const parsed = await parseText(text, today());
       console.log("[text] parsed:", JSON.stringify(parsed));
 
       switch (parsed.action) {
