@@ -65,6 +65,12 @@ interface SplitBillResult {
   unassigned_items: BillItem[];
 }
 
+interface ParsedDebt {
+  person_name: string;
+  item: string;
+  amount: number;
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BOT_TOKEN       = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
@@ -72,7 +78,7 @@ const WEBHOOK_SECRET  = Deno.env.get("TELEGRAM_SECRET") ?? "";
 const GEMINI_API_KEY  = Deno.env.get("GEMINI_API_KEY") ?? "";
 const SPREADSHEET_ID  = Deno.env.get("GOOGLE_SPREADSHEET_ID") ?? "";
 const SERVICE_ACCOUNT = JSON.parse(Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY") ?? "{}");
-const GEMINI_MODEL    = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.0-flash";
+const GEMINI_MODEL    = "gemini-3.1-flash-lite"
 
 function today(): string {
   return SheetsService.witaNow().date;
@@ -140,7 +146,11 @@ function buildHelpMessage(): string {
     `/budget — cek budget\n` +
     `/categories — daftar kategori\n` +
     `/delete [id] — hapus transaksi\n` +
-    `/hapus — hapus transaksi terakhir`
+    `/hapus — hapus transaksi terakhir\n\n` +
+    `<b>💸 Catat tagihan orang lain:</b>\n` +
+    `• <code>deb widhi drink 170k</code>\n` +
+    `• <code>deb budi makan siang 85rb</code>\n` +
+    `/deb [nama] — lihat tagihan per orang`
   );
 }
 
@@ -398,6 +408,34 @@ async function parseSplitBillWithGemini(
   return JSON.parse(raw) as SplitBillResult;
 }
 
+async function parseDebtWithGemini(text: string): Promise<ParsedDebt> {
+  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+  const prompt =
+    `You are an expense tracking assistant for Indonesian users.\n` +
+    `The user paid for someone else's item and wants to track what that person owes them.\n` +
+    `Parse this message and extract the person name, item description, and amount.\n` +
+    `Respond ONLY in valid JSON, no markdown:\n` +
+    `{"person_name":"Widhi","item":"drink","amount":170000}\n\n` +
+    `Rules:\n` +
+    `- "rb"/"ribu" = ×1000, "k" at end = ×1000, "jt"/"juta" = ×1,000,000\n` +
+    `- person_name: the person who owes the money (first proper noun after "deb ")\n` +
+    `- item: what was bought (brief description, in English or Indonesian)\n` +
+    `- amount: integer IDR\n` +
+    `- today: ${today()}\n\n` +
+    `Message: "${text}"`;
+
+  const result = await genAI.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
+  });
+
+  const raw = result.text ?? "";
+  console.log("[parseDebt] raw:", raw);
+  return JSON.parse(raw) as ParsedDebt;
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleExpenseScan(
@@ -503,6 +541,45 @@ async function handleList(chatId: number, limit = 10): Promise<void> {
   await sendMessage(chatId, buildListMessage(transactions));
 }
 
+async function handleToday(chatId: number): Promise<void> {
+  const sheets = getSheets();
+  const { date } = SheetsService.witaNow();
+  const transactions = await sheets.getTransactions({
+    month: new Date(date).getMonth() + 1,
+    year: new Date(date).getFullYear(),
+  });
+  const todayTxns = transactions.filter((t) => t.date === date);
+  console.log("[handleToday] count:", todayTxns.length, "date:", date);
+
+  if (todayTxns.length === 0) {
+    await sendMessage(chatId, `📭 Belum ada transaksi hari ini (${date}).`);
+    return;
+  }
+
+  const total = todayTxns.reduce((s, t) => s + t.amount, 0);
+  const lines = [`📅 <b>Pengeluaran Hari Ini</b> (${date})\n`];
+  for (const t of todayTxns) {
+    const emoji = ["Gaji", "Freelance"].includes(t.category) ? "💰" : "💸";
+    lines.push(
+      `${emoji} <b>${formatIDR(t.amount)}</b> — ${t.category}\n` +
+      `   ${t.merchant ? `🏪 ${t.merchant}` : ""}${t.note ? ` · ${t.note}` : ""}\n` +
+      `   <code>${t.id}</code>\n`
+    );
+  }
+  lines.push(`─────────────────`);
+  lines.push(`Total: <b>${formatIDR(total)}</b>`);
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function handleSpecificMonth(chatId: number, month: number): Promise<void> {
+  // Get current WITA time to determine the current year
+  const { date } = SheetsService.witaNow();
+  const currentYear = new Date(date).getFullYear();
+
+  // Call your existing handleSummary with the chosen month and current year
+  await handleSummary(chatId, month, currentYear);
+}
+
 async function handleDeleteLast(chatId: number): Promise<void> {
   const sheets = getSheets();
   const result = await sheets.deleteLastTransaction();
@@ -563,6 +640,51 @@ async function handleSplitBill(
   await sendMessage(chatId, buildSplitResultMessage(result));
 }
 
+async function handleDebtCreate(chatId: number, text: string): Promise<void> {
+  const sheets = getSheets();
+  const parsed = await parseDebtWithGemini(text);
+  console.log("[handleDebtCreate] parsed:", JSON.stringify(parsed));
+
+  const result = await sheets.addDebt({
+    person_name: parsed.person_name,
+    item: parsed.item,
+    amount: parsed.amount,
+    currency: "IDR",
+  });
+
+  const name = parsed.person_name.charAt(0).toUpperCase() + parsed.person_name.slice(1);
+  await sendMessage(
+    chatId,
+    `💸 <b>Tagihan disimpan!</b>\n\n` +
+    `👤 ${name} belum bayar\n` +
+    `🛍 ${parsed.item}\n` +
+    `💰 ${formatIDR(parsed.amount)}\n` +
+    `🆔 <code>${result.id}</code>`
+  );
+}
+
+async function handleDebtList(chatId: number, personName: string): Promise<void> {
+  const sheets = getSheets();
+  const debts = await sheets.getDebtsByPerson(personName);
+  console.log("[handleDebtList] person:", personName, "count:", debts.length);
+
+  const name = personName.charAt(0).toUpperCase() + personName.slice(1);
+
+  if (debts.length === 0) {
+    await sendMessage(chatId, `✅ Tidak ada tagihan untuk <b>${name}</b>.`);
+    return;
+  }
+
+  const total = debts.reduce((s, d) => s + d.amount, 0);
+  const lines: string[] = [`📋 <b>Hutang ${name} ke kamu</b>\n`];
+  debts.forEach((d, i) => {
+    const dateStr = d.date ? d.date.slice(5).replace("-", " ") : "—";
+    lines.push(`${i + 1}. ${dateStr} — ${d.item} — ${formatIDR(d.amount)}`);
+  });
+  lines.push(`\n💰 <b>Total belum dibayar: ${formatIDR(total)}</b> (${debts.length} item)`);
+  await sendMessage(chatId, lines.join("\n"));
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 Deno.serve(async (req) => {
@@ -608,6 +730,11 @@ Deno.serve(async (req) => {
         await sendMessage(chatId, buildHelpMessage());
         return new Response("ok", { status: 200 });
       }
+      if (text.startsWith("/deb ")) {
+        const personName = text.slice(5).trim();
+        await handleDebtList(chatId, personName);
+        return new Response("ok", { status: 200 });
+      }
       if (text === "/list") {
         await handleList(chatId);
         return new Response("ok", { status: 200 });
@@ -626,6 +753,28 @@ Deno.serve(async (req) => {
       }
       if (text === "/hapus") {
         await handleDeleteLast(chatId);
+        return new Response("ok", { status: 200 });
+      }
+      if (text === "/today") {
+        await handleToday(chatId);
+        return new Response("ok", { status: 200 });
+      }
+
+      // month-1 = Jan, month-12 = Dec
+      const monthMatch = text.match(/^month-(\d+)$/);
+      if (monthMatch) {
+        const monthValue = parseInt(monthMatch[1], 10);
+        
+        // Basic validation to ensure month is between 1 and 12
+        if (monthValue >= 1 && monthValue <= 12) {
+          await handleSpecificMonth(chatId, monthValue);
+          return new Response("ok", { status: 200 });
+        }
+      }
+      
+      // Debt tracking — "deb widhi buy drink 170k"
+      if (/^deb\s+/i.test(text)) {
+        await handleDebtCreate(chatId, text);
         return new Response("ok", { status: 200 });
       }
 

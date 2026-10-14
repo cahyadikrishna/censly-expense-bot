@@ -8,6 +8,16 @@
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/**
+ * sheets.ts — Google Sheets API service for Censly Edge Function
+ * Handles all CRUD operations against the spreadsheet.
+ *
+ * Auth: Service Account via JWT — no OAuth redirect needed.
+ * All timestamps in Asia/Makassar (WITA, UTC+8).
+ */
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 export interface TransactionRow {
   id: string;
   date: string;         // YYYY-MM-DD
@@ -39,6 +49,16 @@ export interface MonthlySummary {
   by_category: { category: string; total: number; count: number; budget: number; remaining: number }[];
   top_merchants: { merchant: string; total: number; count: number }[];
   daily_trend: { day: number; total: number }[];
+}
+
+export interface DebtRow {
+  id: string;
+  date: string;       // YYYY-MM-DD
+  time: string;       // HH:MM
+  person_name: string;
+  item: string;
+  amount: number;
+  currency: string;
 }
 
 interface SheetsConfig {
@@ -501,6 +521,50 @@ export class SheetsService {
         color: r[3] ?? "#A3A3A3",
         icon_name: r[4] ?? "box",
       }));
+  }
+
+  // ── addDebt ─────────────────────────────────────────────────────────────────
+
+  async addDebt(data: Omit<DebtRow, "id" | "date" | "time">): Promise<{ success: boolean; id: string; message: string }> {
+    const token = await this.token();
+    const { date, time } = witaNow();
+    const id = `debt_${Date.now()}`;
+    const row = [
+      id,
+      date,
+      time,
+      data.person_name,
+      data.item,
+      data.amount,
+      data.currency || "IDR",
+    ];
+
+    await sheetsAppend(token, this.spreadsheetId, "Debt People!A:G", [row]);
+    console.log("[sheets] addDebt:", id, data.person_name, data.item, data.amount);
+    return { success: true, id, message: `Debt ${id} added` };
+  }
+
+  // ── getDebtsByPerson ────────────────────────────────────────────────────────
+
+  async getDebtsByPerson(personName: string): Promise<DebtRow[]> {
+    const token = await this.token();
+    const rows = await sheetsGet(token, this.spreadsheetId, "Debt People!A2:G10000");
+
+    const debts = rows
+      .filter((r) => r.length >= 6 && r[0] && String(r[3] ?? "").toLowerCase() === personName.toLowerCase())
+      .map((r): DebtRow => ({
+        id: String(r[0] ?? ""),
+        date: parseSheetDate(r[1]),
+        time: parseSheetTime(r[2]),
+        person_name: String(r[3] ?? ""),
+        item: String(r[4] ?? ""),
+        amount: Number(r[5]) || 0,
+        currency: String(r[6] ?? "IDR"),
+      }));
+
+    // Most recent first
+    debts.sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`));
+    return debts;
   }
 
   // ── witaNow helper (exposed for Edge Function) ────────────────────────────
