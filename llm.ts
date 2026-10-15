@@ -5,6 +5,8 @@
 
 import OpenAI from "npm:openai@7.25.0";
 import { encodeBase64 } from "https://deno.land/std@0.203.0/encoding/base64.ts";
+import { computeSplit } from "./split.ts";
+import type { SplitExtraction } from "./split.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -175,7 +177,7 @@ export function parseExpenseImage(imageBytes: Uint8Array, today: string): Promis
   return callJson<ParsedExpenseImage>("parseExpenseImage", prompt, { imageBytes });
 }
 
-export function parseSplitBill(
+export async function parseSplitBill(
   imageBytes: Uint8Array,
   caption: string,
   today: string
@@ -187,29 +189,32 @@ export function parseSplitBill(
     .replace(/pisah\s*(tagihan|bill)?/gi, "")
     .trim();
 
+  // The model only reads the receipt and maps items to people; split.ts does the math.
   const prompt =
-    `You are a precise bill splitting assistant for Indonesian restaurant bills.\n\n` +
-    `DEFAULT RULES (apply when not overridden):\n` +
-    `- Unassigned items: split equally among all people\n` +
-    `- Tax and service: split equally among all people\n` +
-    `- Shared items (table fee, shared dishes): split equally\n` +
-    `- No people mentioned: 1 person pays full amount\n` +
-    (instructions ? `\nUSER INSTRUCTIONS (override defaults):\n${instructions}\n` : "") +
-    `\nRespond ONLY in valid JSON:\n` +
+    `You are a precise receipt reader for Indonesian restaurant bills.\n` +
+    `Read every line item from the receipt image and decide who ordered each one.\n\n` +
+    (instructions ? `USER INSTRUCTIONS:\n${instructions}\n\n` : `USER INSTRUCTIONS: (none)\n\n`) +
+    `Respond ONLY in valid JSON:\n` +
     `{"store_name":"...","date":"YYYY-MM-DD",` +
-    `"items":[{"name":"...","price":35000,"quantity":1}],` +
+    `"items":[{"name":"Nasi Goreng","price":35000,"quantity":1,"assigned_to":["yoga"]},` +
+    `{"name":"Es Teh","price":20000,"quantity":2,"assigned_to":[]}],` +
     `"subtotal":150000,"tax":16500,"service":15000,"grand_total":181500,` +
-    `"people":[{"name":"yoga","items":[{"name":"Nasi Goreng","price":35000}],` +
-    `"subtotal":35000,"tax":5500,"service":5000,"total":45500}],` +
-    `"unassigned_items":[]}\n\n` +
+    `"people":["yoga","dwi"],"tax_split":"equal"}\n\n` +
     `Rules:\n` +
-    `- All prices as integer IDR\n` +
-    `- Fuzzy match item names to receipt\n` +
-    `- "dibagi rata"=equal split, "proporsional"=proportional to subtotal\n` +
-    `- Sum of people totals must equal grand_total minus unassigned\n` +
+    `- All prices as integer IDR, read digits exactly as printed\n` +
+    `- price = line total as printed on the receipt (already multiplied by quantity)\n` +
+    `- Include every purchased line item; do not include subtotal/tax/service/total lines as items\n` +
+    `- tax = PB1/PPN/pajak/tax amount, service = service charge amount (0 if absent)\n` +
+    `- grand_total = final TOTAL printed on the receipt\n` +
+    `- people = every person named in the instructions, lowercase as written; [] if nobody is named\n` +
+    `- assigned_to = names of people who ordered that item (fuzzy match item names to receipt)\n` +
+    `- assigned_to = [] for shared items, items marked "dibagi rata"/"bagi rata"/shared, or items nobody claimed\n` +
+    `- tax_split = "proportional" only if the instructions say proporsional/proportional, otherwise "equal"\n` +
+    `- Do NOT calculate per-person amounts\n` +
     `- date: ${today} if not visible`;
 
-  return callJson<SplitBillResult>("parseSplitBill", prompt, { imageBytes, maxTokens: 4096 });
+  const extraction = await callJson<SplitExtraction>("parseSplitBill", prompt, { imageBytes, maxTokens: 4096 });
+  return computeSplit(extraction);
 }
 
 export function parseDebt(text: string, today: string): Promise<ParsedDebt> {

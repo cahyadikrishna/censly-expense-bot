@@ -143,23 +143,24 @@ function hasItem(person: PersonShare, pattern: RegExp): boolean {
 function assertSplitConsistent(result: SplitBillResult) {
   assertEquals(result.grand_total, SPLIT_GRAND_TOTAL, "grand_total");
   assertEquals(result.people.length, 3, "people count");
-  const unassigned = result.unassigned_items.reduce((s, i) => s + i.price * i.quantity, 0);
+  assertEquals(result.unassigned_items, [], "split.ts assigns everything");
   const sum = result.people.reduce((s, p) => s + p.total, 0);
-  // Everything must be paid by someone (allow Rp 10/person rounding)
-  assert(
-    Math.abs(sum + unassigned - SPLIT_GRAND_TOTAL) <= 30,
-    `people ${sum} + unassigned ${unassigned} != ${SPLIT_GRAND_TOTAL}`,
-  );
+  assertEquals(sum, SPLIT_GRAND_TOTAL, "people totals must add up to the receipt total exactly");
   const a = findPerson(result, "a"), b = findPerson(result, "b"), c = findPerson(result, "c");
   assert(hasItem(a, /lamb/i) && hasItem(a, /lemongrass/i), `a items: ${JSON.stringify(a.items)}`);
   assert(hasItem(b, /chicken/i) && hasItem(b, /orange/i), `b items: ${JSON.stringify(b.items)}`);
   assert(hasItem(c, /tartufo/i), `c items: ${JSON.stringify(c.items)}`);
-  return { a, b, c, unassigned };
+  for (const p of [a, b, c]) assert(hasItem(p, /evian/i), `${p.name} should share Evian`);
+  return { a, b, c };
 }
 
-/** Expected total = own items + Evian/3 (+ tax/service share). Tolerance Rp 100. */
+/**
+ * Expected total = own items + Evian/3 + tax/service share.
+ * Tolerance Rp 1.500 absorbs a single-digit OCR misread on one line (e.g. 155.000 → 156.000);
+ * the exact sum check above still guarantees the bill is fully covered.
+ */
 function assertTotalNear(person: PersonShare, expected: number) {
-  assert(Math.abs(person.total - expected) <= 100, `${person.name}: total ${person.total}, expected ≈${Math.round(expected)}`);
+  assert(Math.abs(person.total - expected) <= 1500, `${person.name}: total ${person.total}, expected ≈${Math.round(expected)}`);
 }
 
 if (splitImage) {
@@ -180,12 +181,10 @@ if (splitImage) {
         "evian dibagi rata";
       const result = await timed("parseSplitBill equal", () => parseSplitBill(bytes, caption, TODAY));
       console.log("   →", JSON.stringify(result));
-      const { a, b, c, unassigned } = assertSplitConsistent(result);
-      if (unassigned === 0) {
-        assertTotalNear(a, OWN.a + EVIAN_SHARE + EXTRAS / 3);
-        assertTotalNear(b, OWN.b + EVIAN_SHARE + EXTRAS / 3);
-        assertTotalNear(c, OWN.c + EVIAN_SHARE + EXTRAS / 3);
-      }
+      const { a, b, c } = assertSplitConsistent(result);
+      assertTotalNear(a, OWN.a + EVIAN_SHARE + EXTRAS / 3);
+      assertTotalNear(b, OWN.b + EVIAN_SHARE + EXTRAS / 3);
+      assertTotalNear(c, OWN.c + EVIAN_SHARE + EXTRAS / 3);
     },
   });
 
@@ -203,13 +202,11 @@ if (splitImage) {
         "tax dan service proporsional";
       const result = await timed("parseSplitBill proportional", () => parseSplitBill(bytes, caption, TODAY));
       console.log("   →", JSON.stringify(result));
-      const { a, b, c, unassigned } = assertSplitConsistent(result);
-      if (unassigned === 0) {
-        const ratio = 1 + EXTRAS / 745000;
-        assertTotalNear(a, (OWN.a + EVIAN_SHARE) * ratio);
-        assertTotalNear(b, (OWN.b + EVIAN_SHARE) * ratio);
-        assertTotalNear(c, (OWN.c + EVIAN_SHARE) * ratio);
-      }
+      const { a, b, c } = assertSplitConsistent(result);
+      const ratio = 1 + EXTRAS / 745000;
+      assertTotalNear(a, (OWN.a + EVIAN_SHARE) * ratio);
+      assertTotalNear(b, (OWN.b + EVIAN_SHARE) * ratio);
+      assertTotalNear(c, (OWN.c + EVIAN_SHARE) * ratio);
     },
   });
 }
