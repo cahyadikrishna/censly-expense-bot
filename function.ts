@@ -1,9 +1,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { GoogleGenAI } from "https://esm.sh/@google/genai";
-import { encodeBase64 } from "https://deno.land/std@0.203.0/encoding/base64.ts";
 import dayjs from "https://esm.sh/dayjs";
 import { SheetsService } from "./sheets.ts";
 import type { TransactionRow, MonthlySummary } from "./sheets.ts";
+import { parseText, parseExpenseImage, parseSplitBill, parseDebt } from "./llm.ts";
+import type { ParsedTransaction, SplitBillResult } from "./llm.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -27,52 +27,12 @@ interface TelegramUpdate {
   message?: TelegramMessage;
 }
 
-interface ParsedTransaction {
-  action: "create" | "summary" | "delete_last" | "delete" | "list" | "categories" | "budget" | "unknown";
-  type?: "income" | "expense";
-  amount?: number;
-  category?: string;
-  note?: string;
-  date?: string;
-  merchant?: string;
-  id?: string;
-}
-
-interface BillItem {
-  name: string;
-  price: number;
-  quantity: number;
-}
-
-interface PersonShare {
-  name: string;
-  items: { name: string; price: number }[];
-  subtotal: number;
-  tax: number;
-  service: number;
-  total: number;
-}
-
-interface SplitBillResult {
-  store_name: string;
-  date: string;
-  items: BillItem[];
-  subtotal: number;
-  tax: number;
-  service: number;
-  grand_total: number;
-  people: PersonShare[];
-  unassigned_items: BillItem[];
-}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const BOT_TOKEN       = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const WEBHOOK_SECRET  = Deno.env.get("TELEGRAM_SECRET") ?? "";
-const GEMINI_API_KEY  = Deno.env.get("GEMINI_API_KEY") ?? "";
 const SPREADSHEET_ID  = Deno.env.get("GOOGLE_SPREADSHEET_ID") ?? "";
 const SERVICE_ACCOUNT = JSON.parse(Deno.env.get("GOOGLE_SERVICE_ACCOUNT_KEY") ?? "{}");
-const GEMINI_MODEL    = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.0-flash";
 
 function today(): string {
   return SheetsService.witaNow().date;
@@ -140,7 +100,11 @@ function buildHelpMessage(): string {
     `/budget — cek budget\n` +
     `/categories — daftar kategori\n` +
     `/delete [id] — hapus transaksi\n` +
-    `/hapus — hapus transaksi terakhir`
+    `/hapus — hapus transaksi terakhir\n\n` +
+    `<b>💸 Catat tagihan orang lain:</b>\n` +
+    `• <code>deb widhi drink 170k</code>\n` +
+    `• <code>deb budi makan siang 85rb</code>\n` +
+    `/deb [nama] — lihat tagihan per orang`
   );
 }
 
@@ -278,126 +242,6 @@ function buildSplitResultMessage(result: SplitBillResult): string {
   return lines.join("\n");
 }
 
-// ── Gemini calls ──────────────────────────────────────────────────────────────
-
-async function parseTextWithGemini(text: string): Promise<ParsedTransaction> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const prompt =
-    `You are an expense tracking assistant for Indonesian users.\n` +
-    `Parse this message into a transaction or command.\n` +
-    `Respond ONLY in valid JSON, no markdown:\n` +
-    `{"action":"create"|"summary"|"delete_last"|"list"|"categories"|"budget"|"unknown",` +
-    `"type":"income"|"expense","amount":45000,"category":"Makan","note":"desc",` +
-    `"merchant":"store name","date":"YYYY-MM-DD"}\n\n` +
-    `Rules:\n` +
-    `- "rb"/"ribu"=thousands, "jt"/"juta"=millions\n` +
-    `- "kemarin"=yesterday, "hari ini"/"tadi"=today\n` +
-    `- category: Makan|Transport|Belanja|Tagihan|Kesehatan|Hiburan|Gaji|Freelance|Lainnya\n` +
-    `- rekap/summary/pengeluaran bulan → action="summary"\n` +
-    `- hapus/batal/delete last/hapus terakhir → action="delete_last"\n` +
-    `- list/daftar/transaksi → action="list"\n` +
-    `- kategori/categories → action="categories"\n` +
-    `- budget/anggaran → action="budget"\n` +
-    `- default type="expense" unless clearly income\n` +
-    `- today: ${today()}\n\n` +
-    `Message: "${text}"`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseText] raw:", raw);
-  return JSON.parse(raw) as ParsedTransaction;
-}
-
-async function parseExpenseImageWithGemini(imageBytes: Uint8Array): Promise<{
-  category: string; amount: number; merchant: string; note: string; date: string;
-}> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const prompt =
-    `Extract expense data from this receipt.\n` +
-    `Respond ONLY in valid JSON:\n` +
-    `{"category":"Makan","amount":45000,"merchant":"Nama Toko","note":"desc","date":"YYYY-MM-DD"}\n\n` +
-    `Rules:\n` +
-    `- amount = TOTAL as integer IDR\n` +
-    `- category: Makan|Transport|Belanja|Tagihan|Kesehatan|Hiburan|Lainnya\n` +
-    `- merchant = store/restaurant name from receipt\n` +
-    `- date = today if not on receipt: ${today()}`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
-      ],
-    }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseExpenseImage] raw:", raw);
-  return JSON.parse(raw);
-}
-
-async function parseSplitBillWithGemini(
-  imageBytes: Uint8Array,
-  caption: string
-): Promise<SplitBillResult> {
-  const genAI = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-  const instructions = caption
-    .replace(/split\s*(this\s*)?(bill)?/gi, "")
-    .replace(/bagi\s*(tagihan|bill|rata)?/gi, "")
-    .replace(/patungan/gi, "")
-    .replace(/pisah\s*(tagihan|bill)?/gi, "")
-    .trim();
-
-  const prompt =
-    `You are a precise bill splitting assistant for Indonesian restaurant bills.\n\n` +
-    `DEFAULT RULES (apply when not overridden):\n` +
-    `- Unassigned items: split equally among all people\n` +
-    `- Tax and service: split equally among all people\n` +
-    `- Shared items (table fee, shared dishes): split equally\n` +
-    `- No people mentioned: 1 person pays full amount\n` +
-    (instructions ? `\nUSER INSTRUCTIONS (override defaults):\n${instructions}\n` : "") +
-    `\nRespond ONLY in valid JSON:\n` +
-    `{"store_name":"...","date":"YYYY-MM-DD",` +
-    `"items":[{"name":"...","price":35000,"quantity":1}],` +
-    `"subtotal":150000,"tax":16500,"service":15000,"grand_total":181500,` +
-    `"people":[{"name":"yoga","items":[{"name":"Nasi Goreng","price":35000}],` +
-    `"subtotal":35000,"tax":5500,"service":5000,"total":45500}],` +
-    `"unassigned_items":[]}\n\n` +
-    `Rules:\n` +
-    `- All prices as integer IDR\n` +
-    `- Fuzzy match item names to receipt\n` +
-    `- "dibagi rata"=equal split, "proporsional"=proportional to subtotal\n` +
-    `- Sum of people totals must equal grand_total minus unassigned\n` +
-    `- date: ${today()} if not visible`;
-
-  const result = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { mimeType: "image/jpeg", data: encodeBase64(imageBytes) } },
-      ],
-    }],
-    config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
-  });
-
-  const raw = result.text ?? "";
-  console.log("[parseSplitBill] raw:", raw);
-  return JSON.parse(raw) as SplitBillResult;
-}
-
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleExpenseScan(
@@ -408,7 +252,7 @@ async function handleExpenseScan(
   const sheets = getSheets();
   const { date, time } = SheetsService.witaNow();
 
-  const extracted = await parseExpenseImageWithGemini(imageBytes);
+  const extracted = await parseExpenseImage(imageBytes, today());
   console.log("[handleExpenseScan] extracted:", JSON.stringify(extracted));
 
   const result = await sheets.addTransaction({
@@ -503,6 +347,45 @@ async function handleList(chatId: number, limit = 10): Promise<void> {
   await sendMessage(chatId, buildListMessage(transactions));
 }
 
+async function handleToday(chatId: number): Promise<void> {
+  const sheets = getSheets();
+  const { date } = SheetsService.witaNow();
+  const transactions = await sheets.getTransactions({
+    month: new Date(date).getMonth() + 1,
+    year: new Date(date).getFullYear(),
+  });
+  const todayTxns = transactions.filter((t) => t.date === date);
+  console.log("[handleToday] count:", todayTxns.length, "date:", date);
+
+  if (todayTxns.length === 0) {
+    await sendMessage(chatId, `📭 Belum ada transaksi hari ini (${date}).`);
+    return;
+  }
+
+  const total = todayTxns.reduce((s, t) => s + t.amount, 0);
+  const lines = [`📅 <b>Pengeluaran Hari Ini</b> (${date})\n`];
+  for (const t of todayTxns) {
+    const emoji = ["Gaji", "Freelance"].includes(t.category) ? "💰" : "💸";
+    lines.push(
+      `${emoji} <b>${formatIDR(t.amount)}</b> — ${t.category}\n` +
+      `   ${t.merchant ? `🏪 ${t.merchant}` : ""}${t.note ? ` · ${t.note}` : ""}\n` +
+      `   <code>${t.id}</code>\n`
+    );
+  }
+  lines.push(`─────────────────`);
+  lines.push(`Total: <b>${formatIDR(total)}</b>`);
+  await sendMessage(chatId, lines.join("\n"));
+}
+
+async function handleSpecificMonth(chatId: number, month: number): Promise<void> {
+  // Get current WITA time to determine the current year
+  const { date } = SheetsService.witaNow();
+  const currentYear = new Date(date).getFullYear();
+
+  // Call your existing handleSummary with the chosen month and current year
+  await handleSummary(chatId, month, currentYear);
+}
+
 async function handleDeleteLast(chatId: number): Promise<void> {
   const sheets = getSheets();
   const result = await sheets.deleteLastTransaction();
@@ -557,10 +440,55 @@ async function handleSplitBill(
   caption: string,
   chatId: number
 ): Promise<void> {
-  const result = await parseSplitBillWithGemini(imageBytes, caption);
+  const result = await parseSplitBill(imageBytes, caption, today());
   console.log("[handleSplitBill] people:", result.people.length, "total:", result.grand_total);
   // Split bills are not saved to the sheet — display only
   await sendMessage(chatId, buildSplitResultMessage(result));
+}
+
+async function handleDebtCreate(chatId: number, text: string): Promise<void> {
+  const sheets = getSheets();
+  const parsed = await parseDebt(text, today());
+  console.log("[handleDebtCreate] parsed:", JSON.stringify(parsed));
+
+  const result = await sheets.addDebt({
+    person_name: parsed.person_name,
+    item: parsed.item,
+    amount: parsed.amount,
+    currency: "IDR",
+  });
+
+  const name = parsed.person_name.charAt(0).toUpperCase() + parsed.person_name.slice(1);
+  await sendMessage(
+    chatId,
+    `💸 <b>Tagihan disimpan!</b>\n\n` +
+    `👤 ${name} belum bayar\n` +
+    `🛍 ${parsed.item}\n` +
+    `💰 ${formatIDR(parsed.amount)}\n` +
+    `🆔 <code>${result.id}</code>`
+  );
+}
+
+async function handleDebtList(chatId: number, personName: string): Promise<void> {
+  const sheets = getSheets();
+  const debts = await sheets.getDebtsByPerson(personName);
+  console.log("[handleDebtList] person:", personName, "count:", debts.length);
+
+  const name = personName.charAt(0).toUpperCase() + personName.slice(1);
+
+  if (debts.length === 0) {
+    await sendMessage(chatId, `✅ Tidak ada tagihan untuk <b>${name}</b>.`);
+    return;
+  }
+
+  const total = debts.reduce((s, d) => s + d.amount, 0);
+  const lines: string[] = [`📋 <b>Hutang ${name} ke kamu</b>\n`];
+  debts.forEach((d, i) => {
+    const dateStr = d.date ? d.date.slice(5).replace("-", " ") : "—";
+    lines.push(`${i + 1}. ${dateStr} — ${d.item} — ${formatIDR(d.amount)}`);
+  });
+  lines.push(`\n💰 <b>Total belum dibayar: ${formatIDR(total)}</b> (${debts.length} item)`);
+  await sendMessage(chatId, lines.join("\n"));
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
@@ -608,6 +536,11 @@ Deno.serve(async (req) => {
         await sendMessage(chatId, buildHelpMessage());
         return new Response("ok", { status: 200 });
       }
+      if (text.startsWith("/deb ")) {
+        const personName = text.slice(5).trim();
+        await handleDebtList(chatId, personName);
+        return new Response("ok", { status: 200 });
+      }
       if (text === "/list") {
         await handleList(chatId);
         return new Response("ok", { status: 200 });
@@ -628,6 +561,28 @@ Deno.serve(async (req) => {
         await handleDeleteLast(chatId);
         return new Response("ok", { status: 200 });
       }
+      if (text === "/today") {
+        await handleToday(chatId);
+        return new Response("ok", { status: 200 });
+      }
+
+      // month-1 = Jan, month-12 = Dec
+      const monthMatch = text.match(/^month-(\d+)$/);
+      if (monthMatch) {
+        const monthValue = parseInt(monthMatch[1], 10);
+        
+        // Basic validation to ensure month is between 1 and 12
+        if (monthValue >= 1 && monthValue <= 12) {
+          await handleSpecificMonth(chatId, monthValue);
+          return new Response("ok", { status: 200 });
+        }
+      }
+      
+      // Debt tracking — "deb widhi buy drink 170k"
+      if (/^deb\s+/i.test(text)) {
+        await handleDebtCreate(chatId, text);
+        return new Response("ok", { status: 200 });
+      }
 
       // Delete by ID — match "delete txn_...", "/delete txn_...", "hapus txn_..."
       const txnIdMatch = text.match(/\b(txn_\d+)\b/);
@@ -637,7 +592,7 @@ Deno.serve(async (req) => {
       }
 
       // Natural language
-      const parsed = await parseTextWithGemini(text);
+      const parsed = await parseText(text, today());
       console.log("[text] parsed:", JSON.stringify(parsed));
 
       switch (parsed.action) {

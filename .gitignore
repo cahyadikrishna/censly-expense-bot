@@ -6,6 +6,10 @@
 !deno.json
 !package.json
 
+# Test fixtures (personal receipts)
+tests/fixtures/*
+!tests/fixtures/.gitkeep
+
 # Claude Code
 .claude/
 
