@@ -6,8 +6,9 @@
  * Run:   deno task test:live
  */
 
-import { assert, assertEquals } from "jsr:@std/assert@1.0.13";
+import { assert, assertEquals, assertMatch } from "jsr:@std/assert@1.0.13";
 import { parseDebt, parseExpenseImage, parseSplitBill, parseText } from "../llm.ts";
+import type { PersonShare, SplitBillResult } from "../llm.ts";
 
 const TODAY = "2026-10-15";
 const YESTERDAY = "2026-10-14";
@@ -89,6 +90,13 @@ Deno.test({
 
 // ── Receipt images ────────────────────────────────────────────────────────────
 
+// Known values for fixtures, matched by filename substring. Unknown fixtures get shape checks only.
+const KNOWN_RECEIPTS: { match: string; amount: number; date: string; merchant: RegExp }[] = [
+  { match: "4171e725", amount: 12800,  date: "2020-11-07", merchant: /indomaret/i },
+  { match: "owAtJOHf", amount: 75400,  date: "2024-04-04", merchant: /indomaret/i },
+  { match: "skye",     amount: 901450, date: "2015-08-03", merchant: /skye/i },
+];
+
 const images = fixtures();
 if (!ignore && images.length === 0) console.warn("No receipt photos in tests/fixtures/ — image tests skipped");
 
@@ -104,28 +112,104 @@ for (const path of images) {
       assert(EXPENSE_CATEGORIES.includes(parsed.category), `unexpected category ${parsed.category}`);
       assert(DATE_RE.test(parsed.date), `bad date ${parsed.date}`);
       assert(parsed.merchant, "merchant should not be empty");
+
+      const known = KNOWN_RECEIPTS.find((k) => path.toLowerCase().includes(k.match.toLowerCase()));
+      if (known) {
+        assertEquals(parsed.amount, known.amount, "amount (TOTAL after discounts)");
+        assertEquals(parsed.date, known.date, "date");
+        assertMatch(parsed.merchant, known.merchant);
+      }
     },
   });
 }
 
-if (images.length > 0) {
+// ── Split bill (SKYE restaurant, 3 people) ────────────────────────────────────
+// Items: Lamb Chops 265k, Roasted Chicken 135k, Al Tartufo 155k, Lemongrass tea 45k,
+// Orange Jc 50k, Evian Large 95k. Subtotal 745k, Service 74.5k, PB1 81.95k, Total 901.450.
+
+const splitImage = images.find((p) => /split/i.test(p));
+const SPLIT_GRAND_TOTAL = 901450;
+
+function findPerson(result: SplitBillResult, name: string): PersonShare {
+  const p = result.people.find((x) => x.name.toLowerCase() === name);
+  assert(p, `person "${name}" missing, got ${result.people.map((x) => x.name).join(", ")}`);
+  return p;
+}
+
+function hasItem(person: PersonShare, pattern: RegExp): boolean {
+  return person.items.some((i) => pattern.test(i.name));
+}
+
+function assertSplitConsistent(result: SplitBillResult) {
+  assertEquals(result.grand_total, SPLIT_GRAND_TOTAL, "grand_total");
+  assertEquals(result.people.length, 3, "people count");
+  const unassigned = result.unassigned_items.reduce((s, i) => s + i.price * i.quantity, 0);
+  const sum = result.people.reduce((s, p) => s + p.total, 0);
+  // Everything must be paid by someone (allow Rp 10/person rounding)
+  assert(
+    Math.abs(sum + unassigned - SPLIT_GRAND_TOTAL) <= 30,
+    `people ${sum} + unassigned ${unassigned} != ${SPLIT_GRAND_TOTAL}`,
+  );
+  const a = findPerson(result, "a"), b = findPerson(result, "b"), c = findPerson(result, "c");
+  assert(hasItem(a, /lamb/i) && hasItem(a, /lemongrass/i), `a items: ${JSON.stringify(a.items)}`);
+  assert(hasItem(b, /chicken/i) && hasItem(b, /orange/i), `b items: ${JSON.stringify(b.items)}`);
+  assert(hasItem(c, /tartufo/i), `c items: ${JSON.stringify(c.items)}`);
+  return { a, b, c, unassigned };
+}
+
+/** Expected total = own items + Evian/3 (+ tax/service share). Tolerance Rp 100. */
+function assertTotalNear(person: PersonShare, expected: number) {
+  assert(Math.abs(person.total - expected) <= 100, `${person.name}: total ${person.total}, expected ≈${Math.round(expected)}`);
+}
+
+if (splitImage) {
+  const EXTRAS = 74500 + 81950;    // service + PB1
+  const EVIAN_SHARE = 95000 / 3;
+  const OWN = { a: 265000 + 45000, b: 135000 + 50000, c: 155000 };
+
   Deno.test({
-    name: `parseSplitBill: ${images[0]} (2 people, equal split)`,
+    name: `parseSplitBill: 3 people, tax/service equal (default)`,
     ignore,
     fn: async () => {
-      const bytes = await Deno.readFile(images[0]);
-      const caption = "split this bill\nandi dan budi, semua dibagi rata";
-      const result = await timed("parseSplitBill", () => parseSplitBill(bytes, caption, TODAY));
+      const bytes = await Deno.readFile(splitImage);
+      const caption =
+        "split this bill\n" +
+        "a: lamb chops, lemongrass tea\n" +
+        "b: roasted chicken, orange juice\n" +
+        "c: al tartufo\n" +
+        "evian dibagi rata";
+      const result = await timed("parseSplitBill equal", () => parseSplitBill(bytes, caption, TODAY));
       console.log("   →", JSON.stringify(result));
-      assertEquals(result.people.length, 2);
-      assert(result.grand_total > 0);
-      const unassigned = result.unassigned_items.reduce((s, i) => s + i.price * i.quantity, 0);
-      const sum = result.people.reduce((s, p) => s + p.total, 0);
-      // Allow small rounding differences (≤ Rp 10 per person)
-      assert(
-        Math.abs(sum - (result.grand_total - unassigned)) <= 10 * result.people.length,
-        `people totals ${sum} != grand_total ${result.grand_total} - unassigned ${unassigned}`,
-      );
+      const { a, b, c, unassigned } = assertSplitConsistent(result);
+      if (unassigned === 0) {
+        assertTotalNear(a, OWN.a + EVIAN_SHARE + EXTRAS / 3);
+        assertTotalNear(b, OWN.b + EVIAN_SHARE + EXTRAS / 3);
+        assertTotalNear(c, OWN.c + EVIAN_SHARE + EXTRAS / 3);
+      }
+    },
+  });
+
+  Deno.test({
+    name: `parseSplitBill: 3 people, tax/service proporsional`,
+    ignore,
+    fn: async () => {
+      const bytes = await Deno.readFile(splitImage);
+      const caption =
+        "split this bill\n" +
+        "a: lamb chops, lemongrass tea\n" +
+        "b: roasted chicken, orange juice\n" +
+        "c: al tartufo\n" +
+        "evian dibagi rata\n" +
+        "tax dan service proporsional";
+      const result = await timed("parseSplitBill proportional", () => parseSplitBill(bytes, caption, TODAY));
+      console.log("   →", JSON.stringify(result));
+      const { a, b, c, unassigned } = assertSplitConsistent(result);
+      if (unassigned === 0) {
+        const ratio = 1 + EXTRAS / 745000;
+        assertTotalNear(a, (OWN.a + EVIAN_SHARE) * ratio);
+        assertTotalNear(b, (OWN.b + EVIAN_SHARE) * ratio);
+        assertTotalNear(c, (OWN.c + EVIAN_SHARE) * ratio);
+      }
     },
   });
 }

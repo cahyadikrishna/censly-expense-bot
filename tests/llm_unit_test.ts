@@ -4,7 +4,7 @@
  */
 
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
-import { parseDebt, parseExpenseImage, parseText } from "../llm.ts";
+import { parseDebt, parseExpenseImage, parseSplitBill, parseText } from "../llm.ts";
 
 const TODAY = "2026-10-15";
 
@@ -80,8 +80,9 @@ Deno.test("parseExpenseImage attaches image as base64 data URL in user message",
 
     const content = f.calls[0].body.messages[0].content;
     assertEquals(content.length, 2);
-    assertEquals(content[1].type, "image_url");
-    assertEquals(content[1].image_url.url, "data:image/jpeg;base64,/9j/4A==");
+    assertEquals(content[0].type, "image_url", "image must come before text");
+    assertEquals(content[0].image_url.url, "data:image/jpeg;base64,/9j/4A==");
+    assertEquals(content[1].type, "text");
   } finally { f.restore(); }
 }));
 
@@ -122,6 +123,34 @@ Deno.test("retries once on null content", withEnv(async () => {
   try {
     const parsed = await parseText("budget", TODAY);
     assertEquals(parsed.action, "budget");
+  } finally { f.restore(); }
+}));
+
+Deno.test("retries when model echoes response_format", withEnv(async () => {
+  const f = stubFetch([`{"type": "json_object"}`, `{"action":"list"}`]);
+  try {
+    const parsed = await parseText("list", TODAY);
+    assertEquals(parsed.action, "list");
+    assertEquals(f.calls.length, 2);
+  } finally { f.restore(); }
+}));
+
+Deno.test("unwraps payload nested under echoed response_format", withEnv(async () => {
+  const f = stubFetch([`{"type":"json_object","data":{"category":"Belanja","amount":75400,"merchant":"Indomaret","note":"","date":"2024-04-04"}}`]);
+  try {
+    const parsed = await parseExpenseImage(new Uint8Array([1]), TODAY);
+    assertEquals(parsed.amount, 75400);
+    assertEquals(f.calls.length, 1);
+  } finally { f.restore(); }
+}));
+
+Deno.test("split caption keeps \"dibagi rata\" instruction", withEnv(async () => {
+  const f = stubFetch([`{"store_name":"x","date":"${TODAY}","items":[],"subtotal":0,"tax":0,"service":0,"grand_total":0,"people":[],"unassigned_items":[]}`]);
+  try {
+    await parseSplitBill(new Uint8Array([1]), "split this bill\na: lamb\nevian dibagi rata", TODAY);
+    const text: string = f.calls[0].body.messages[0].content[1].text;
+    assert(text.includes("evian dibagi rata"), "instruction was mangled");
+    assert(!/split this bill/i.test(text), "trigger phrase should be stripped");
   } finally { f.restore(); }
 }));
 

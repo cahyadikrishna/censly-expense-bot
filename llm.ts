@@ -87,13 +87,16 @@ async function callJson<T>(
 
   const client = new OpenAI({ apiKey, baseURL, maxRetries: 1, timeout: 60_000 });
 
-  const content: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: prompt }];
+  // Image must come BEFORE the text: with text first + JSON mode, deepseek-flash
+  // sometimes echoes the response_format ({"type":"json_object"}) instead of answering.
+  const content: OpenAI.Chat.ChatCompletionContentPart[] = [];
   if (opts.imageBytes) {
     content.push({
       type: "image_url",
       image_url: { url: `data:image/jpeg;base64,${encodeBase64(opts.imageBytes)}` },
     });
   }
+  content.push({ type: "text", text: prompt });
 
   // DeepSeek JSON mode can occasionally return empty content — retry once.
   let lastError = "";
@@ -117,7 +120,14 @@ async function callJson<T>(
       continue;
     }
     try {
-      return JSON.parse(cleaned) as T;
+      const parsed = JSON.parse(cleaned);
+      if (parsed?.type === "json_object") {
+        // Echoed response_format — unwrap if the real payload is nested, else retry
+        if (parsed.data && typeof parsed.data === "object") return parsed.data as T;
+        lastError = "echoed response_format instead of data";
+        continue;
+      }
+      return parsed as T;
     } catch (err) {
       lastError = `invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -172,7 +182,7 @@ export function parseSplitBill(
 ): Promise<SplitBillResult> {
   const instructions = caption
     .replace(/split\s*(this\s*)?(bill)?/gi, "")
-    .replace(/bagi\s*(tagihan|bill|rata)?/gi, "")
+    .replace(/\bbagi\s*(tagihan|bill|rata)?/gi, "") // \b keeps "dibagi rata" instructions intact
     .replace(/patungan/gi, "")
     .replace(/pisah\s*(tagihan|bill)?/gi, "")
     .trim();
